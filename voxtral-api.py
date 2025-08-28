@@ -299,7 +299,9 @@ def split_audio_intelligently(wav_file: str) -> List[Tuple[str, float, float]]:
         )
         chunks.append((str(chunk_file), start_ms / 1000.0, split_ms / 1000.0))
         
-        print(f"Created chunk {i}: {start_ms/1000:.1f}s - {split_ms/1000:.1f}s ({(split_ms-start_ms)/1000:.1f}s)")
+        # Use 1-based numbering for display
+        display_chunk_num = i + 1
+        print(f"Created chunk {display_chunk_num}: {start_ms/1000:.1f}s - {split_ms/1000:.1f}s ({(split_ms-start_ms)/1000:.1f}s)")
         start_ms = split_ms
     
     return chunks
@@ -520,7 +522,9 @@ def main(input_file: str, specified_language: str = None):
                 result = transcribe_chunk(chunk_file, i, language=specified_language)
                 usage_stats.chunks_processed += 1
             except Exception as e:
-                print(f"Failed to transcribe chunk {i}: {e}")
+                # Use 1-based numbering for display
+                display_chunk_num = i + 1
+                print(f"Failed to transcribe chunk {display_chunk_num}: {e}")
                 print("Continuing with empty segments for this chunk...")
                 result = {'text': '', 'segments': [], 'language': detected_language or 'en'}
             
@@ -578,7 +582,9 @@ def main(input_file: str, specified_language: str = None):
             chunk_text = result.get('text', '')
             if chunk_text:
                 full_transcript += " " + chunk_text
-                print(f"Chunk {i} text length: {len(chunk_text)} characters")
+                # Use 1-based numbering for display
+                display_chunk_num = i + 1
+                print(f"Chunk {display_chunk_num} text length: {len(chunk_text)} characters")
             
             # Clean up chunk file if it's not the original
             if chunk_file != wav_file and os.path.exists(chunk_file):
