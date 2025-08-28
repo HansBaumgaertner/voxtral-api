@@ -47,8 +47,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 2. **Clone the repository:**
 ```bash
-git clone https://github.com/yourusername/voxtral-transcription.git
-cd voxtral-transcription
+git clone https://github.com/HansBaumgaertner/voxtral-api
+cd voxtral-api
 ```
 
 3. **Create and activate virtual environment:**
@@ -66,8 +66,8 @@ uv pip install -r requirements.txt
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/voxtral-transcription.git
-cd voxtral-transcription
+git clone https://github.com/HansBaumgaertner/voxtral-api
+cd voxtral-api
 
 # Create virtual environment
 python -m venv .venv
