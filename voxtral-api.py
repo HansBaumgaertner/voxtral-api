@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Voxtral API Transcription Script
 Transcribes audio/video files using Mistral's Voxtral API with segment timestamps
@@ -40,7 +39,7 @@ try:
     from pydub.silence import detect_silence
 except ImportError:
     print("Please install required packages:")
-    print("pip install pydub")
+    print("uv pip install pydub")
     sys.exit(1)
 
 # Configuration
@@ -53,13 +52,20 @@ if not MISTRAL_API_KEY:
     print("\nSee README.md for detailed setup instructions.")
     sys.exit(1)
 
+# Check for HF_TOKEN if using Pyannote
+HF_TOKEN = os.environ.get('HF_TOKEN')
+if not HF_TOKEN:
+    print("Warning: HF_TOKEN not set. Pyannote VAD will not work.")
+    print("To use Pyannote VAD for intelligent splitting, add to .env file:")
+    print("HF_TOKEN=your-huggingface-token")
+    print("Get your token from: https://huggingface.co/settings/tokens")
+    print("Make sure you have access to pyannote/segmentation-3.0 model")
+
 # Audio configuration
 TARGET_SAMPLE_RATE = 16000  # 16kHz
 TARGET_CHANNELS = 1  # Mono
 TARGET_SAMPLE_WIDTH = 2  # 16-bit (2 bytes)
-MAX_CHUNK_DURATION_MS = 15 * 60 * 1000  # 15 minutes in milliseconds
-MIN_SILENCE_LENGTH_MS = 1000  # 1 second of silence
-SILENCE_THRESH_DB = -40  # Silence threshold in dB
+MAX_CHUNK_DURATION_MS = 15 * 60 * 1000  # 15 minutes
 
 # Supported languages by Voxtral API (based on documentation)
 SUPPORTED_LANGUAGES = {
@@ -120,7 +126,6 @@ LANGUAGE_CODES = {
     'swahili': 'sw', 'sw': 'sw'
 }
 
-
 @dataclass
 class UsageStats:
     """Track usage statistics across all chunks"""
@@ -129,7 +134,6 @@ class UsageStats:
     completion_tokens: int = 0
     total_tokens: int = 0
     chunks_processed: int = 0
-
 
 def check_wav_format(wav_file: str) -> bool:
     """
@@ -146,7 +150,6 @@ def check_wav_format(wav_file: str) -> bool:
                    frame_rate == TARGET_SAMPLE_RATE)
     except:
         return False
-
 
 def extract_audio_to_wav(input_file: str) -> str:
     """
@@ -180,6 +183,9 @@ def extract_audio_to_wav(input_file: str) -> str:
         '-acodec', 'pcm_s16le',  # PCM 16-bit little-endian
         '-ar', str(TARGET_SAMPLE_RATE),  # 16kHz sample rate
         '-ac', str(TARGET_CHANNELS),  # Mono
+        '-filter:a', (
+            'dynaudnorm,'
+        ), 
         '-y',  # Overwrite output
         str(output_wav)
     ]
@@ -204,59 +210,144 @@ def extract_audio_to_wav(input_file: str) -> str:
         print("Windows: Download from https://ffmpeg.org/download.html")
         sys.exit(1)
 
-
 def find_silence_splits(audio: AudioSegment, max_duration_ms: int) -> List[int]:
     """
-    Find optimal points to split audio based on silence detection
-    Returns list of timestamps (in ms) where to split
+    Find optimal split points using Pyannote v3 VAD
+    Returns: list of timestamps (ms) at which to split.
     """
+    import os
+    import tempfile
+    import soundfile as sf
+    
+    # Early exit if not long enough
     duration_ms = len(audio)
-    
     if duration_ms <= max_duration_ms:
-        return []  # No need to split
+        return []
+
+    # Config
+    WINDOW_MS = 180_000             # Scan ±3 minutes around each target boundary
+    MIN_GAP_AFTER_SPLIT_MS = 30_000 # Don't split within 30s of the previous split
+    MIN_NON_SPEECH_MS = 300         # Require 0.3s of non-speech to consider a cut
+    TARGET_SR = 16_000              # Pyannote works with 16 kHz
+
+    # Get HuggingFace token
+    HF_TOKEN = os.environ.get('HF_TOKEN')
+    if not HF_TOKEN:
+        raise RuntimeError(
+            "HF_TOKEN not found in environment variables. "
+            "Please add HF_TOKEN=your-token-here to your .env file. "
+            "You can get your token from https://huggingface.co/settings/tokens"
+        )
+
+    # Import Pyannote
+    try:
+        import numpy as np
+        import torch
+        from pyannote.audio import Model
+        from pyannote.audio.pipelines import VoiceActivityDetection
+    except ImportError as e:
+        raise RuntimeError(
+            "Pyannote not installed. Please install with: "
+            "uv pip install pyannote.audio torch torchaudio soundfile"
+        ) from e
+
+    # Convert pydub AudioSegment -> numpy array
+    a = audio.set_frame_rate(TARGET_SR).set_channels(1).set_sample_width(2)
+    samples = np.array(a.get_array_of_samples(), dtype=np.int16).astype(np.float32) / 32768.0
     
-    print("Detecting silence for optimal splitting...")
+    # Save temporarily for Pyannote (it needs a file)
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+        tmp_path = tmp_file.name
+        sf.write(tmp_path, samples, TARGET_SR)
     
-    # Detect all silence periods
-    silence_ranges = detect_silence(
-        audio, 
-        min_silence_len=MIN_SILENCE_LENGTH_MS,
-        silence_thresh=SILENCE_THRESH_DB
-    )
+    try:
+        # Initialize Pyannote VAD with auth token
+        print("Loading Pyannote segmentation model (this may take a moment on first run)...")
+        model = Model.from_pretrained(
+            "pyannote/segmentation-3.0",
+            use_auth_token=HF_TOKEN
+        )
+        
+        pipeline = VoiceActivityDetection(segmentation=model)
+        
+        # Parameters for Pyannote v3 VAD pipeline
+        HYPER_PARAMETERS = {
+            "min_duration_on": 0.8,    # Minimum duration of speech segments
+            "min_duration_off": 0.4,   # Minimum duration of non-speech segments
+        }
+        
+        # Instantiate with hyperparameters
+        pipeline.instantiate(HYPER_PARAMETERS)
+        
+        # Run VAD
+        print("Running Pyannote VAD analysis...")
+        vad_output = pipeline(tmp_path)
+        
+        # Build non-speech intervals from VAD output
+        non_speech = []
+        prev_end_ms = 0
+        speech_count = 0
+        
+        for segment in vad_output.get_timeline():
+            start_ms = int(segment.start * 1000)
+            end_ms = int(segment.end * 1000)
+            speech_count += 1
+            
+            # Gap before this speech segment
+            if start_ms - prev_end_ms >= MIN_NON_SPEECH_MS:
+                non_speech.append((prev_end_ms, start_ms))
+                if start_ms - prev_end_ms > 2000:  # Log significant gaps
+                    print(f"Found {(start_ms - prev_end_ms)/1000:.1f}s non-speech at {prev_end_ms/1000:.1f}s")
+            
+            prev_end_ms = end_ms
+        
+        # Final gap after last speech
+        if duration_ms - prev_end_ms >= MIN_NON_SPEECH_MS:
+            non_speech.append((prev_end_ms, duration_ms))
+            if duration_ms - prev_end_ms > 2000:
+                print(f"Found {(duration_ms - prev_end_ms)/1000:.1f}s non-speech at end")
+        
+        print(f"Pyannote found {speech_count} speech segments and {len(non_speech)} non-speech regions")
+        
+    finally:
+        # Clean up temp file
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
     
+    # Find split points (same logic as before)
     split_points = []
     current_position = 0
-    
-    while current_position + max_duration_ms < duration_ms:
-        # Find target position
-        target_position = current_position + max_duration_ms
-        
-        # Look for silence around target position (±30 seconds)
-        search_start = max(target_position - 30000, current_position + 60000)  # At least 1 min from last split
-        search_end = min(target_position + 30000, duration_ms)
-        
-        best_silence = None
-        min_distance = float('inf')
-        
-        for silence_start, silence_end in silence_ranges:
-            silence_middle = (silence_start + silence_end) / 2
-            
-            if search_start <= silence_middle <= search_end:
-                distance = abs(silence_middle - target_position)
-                if distance < min_distance:
-                    min_distance = distance
-                    best_silence = silence_middle
-        
-        if best_silence:
-            split_points.append(int(best_silence))
-            current_position = int(best_silence)
-        else:
-            # No silence found, force split at target
-            split_points.append(target_position)
-            current_position = target_position
-    
-    return split_points
 
+    while current_position + max_duration_ms < duration_ms:
+        target = current_position + max_duration_ms
+        search_start = max(target - WINDOW_MS, current_position + MIN_GAP_AFTER_SPLIT_MS)
+        search_end = min(target + WINDOW_MS, duration_ms)
+
+        # Gather candidate cut points from non-speech intervals
+        candidates = []
+        for ns_start, ns_end in non_speech:
+            if ns_end <= search_start or ns_start >= search_end:
+                continue
+            s = max(ns_start, search_start)
+            e = min(ns_end, search_end)
+            if e - s < MIN_NON_SPEECH_MS:
+                continue
+            cut_ms = min(max(target, s), e)
+            candidates.append((abs(cut_ms - target), int(cut_ms)))
+
+        if candidates:
+            cut_ms = min(candidates, key=lambda x: x[0])[1]
+            split_points.append(cut_ms)
+            current_position = cut_ms
+            print(f"Pyannote split {len(split_points)}: {cut_ms/1000:.1f}s (target ~{target/1000:.1f}s)")
+        else:
+            # No suitable non-speech nearby, forcing hard cut
+            cut_ms = int(target)
+            split_points.append(cut_ms)
+            current_position = cut_ms
+            print(f"No non-speech near target; forcing split {len(split_points)} at {target/1000:.1f}s")
+
+    return split_points
 
 def split_audio_intelligently(wav_file: str) -> List[Tuple[str, float, float]]:
     """
@@ -305,7 +396,6 @@ def split_audio_intelligently(wav_file: str) -> List[Tuple[str, float, float]]:
         start_ms = split_ms
     
     return chunks
-
 
 def transcribe_chunk(audio_file: str, chunk_index: int = 0, language: str = None, max_retries: int = 3) -> Dict:
     """
@@ -410,7 +500,6 @@ def transcribe_chunk(audio_file: str, chunk_index: int = 0, language: str = None
                 continue
             raise
 
-
 def align_timestamps(segments: List[Dict], offset_seconds: float) -> List[Dict]:
     """
     Adjust timestamps in segments by adding an offset
@@ -424,7 +513,6 @@ def align_timestamps(segments: List[Dict], offset_seconds: float) -> List[Dict]:
     
     return aligned_segments
 
-
 def format_timestamp_srt(seconds: float) -> str:
     """
     Convert seconds to SRT timestamp format (HH:MM:SS,mmm)
@@ -435,7 +523,6 @@ def format_timestamp_srt(seconds: float) -> str:
     millis = int((seconds % 1) * 1000)
     
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
 
 def create_srt_file(segments: List[Dict], output_file: str) -> None:
     """
@@ -456,31 +543,37 @@ def create_srt_file(segments: List[Dict], output_file: str) -> None:
     
     print(f"SRT file created: {output_file}")
 
-
 def format_usage_stats(stats: UsageStats) -> str:
     """
     Format usage statistics for display
     """
+    def _fmt_hms(seconds_float: float) -> str:
+        total = int(round(seconds_float))
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h} h {m} min {s} s"
+        return f"{m} min {s} s"
+
     output = []
     output.append("=" * 50)
     output.append("USAGE STATISTICS")
     output.append("=" * 50)
     output.append(f"Chunks processed: {stats.chunks_processed}")
-    output.append(f"Total audio duration: {stats.prompt_audio_seconds:.1f} seconds ({stats.prompt_audio_seconds/60:.1f} minutes)")
+    output.append(f"Total audio duration: {stats.prompt_audio_seconds:.1f} seconds ({_fmt_hms(stats.prompt_audio_seconds)})")
     output.append(f"Prompt tokens: {stats.prompt_tokens:,}")
     output.append(f"Completion tokens: {stats.completion_tokens:,}")
     output.append(f"Total tokens: {stats.total_tokens:,}")
     
     # Calculate approximate cost (using estimated rates - adjust as needed)
     # Voxtral pricing is typically per audio second/minute
-    estimated_cost = (stats.prompt_audio_seconds / 60) * 0.001  # Example rate: $0.001 per minute
+    estimated_cost = (stats.prompt_audio_seconds / 60) * 0.001  # Example rate: €0.001 per minute
     output.append(f"Estimated cost: €{estimated_cost:.4f}")
     output.append("=" * 50)
     
     return "\n".join(output)
 
-
-def main(input_file: str, specified_language: str = None):
+def main(input_file: str, specified_language: str = None, debug: bool = False):
     """
     Main function to orchestrate the transcription process
     
@@ -527,6 +620,17 @@ def main(input_file: str, specified_language: str = None):
                 print(f"Failed to transcribe chunk {display_chunk_num}: {e}")
                 print("Continuing with empty segments for this chunk...")
                 result = {'text': '', 'segments': [], 'language': detected_language or 'en'}
+            
+            # Save debug verbose JSON if needed
+            if debug:
+                display_chunk_num = i + 1
+                debug_json_path = input_path.parent / f"{input_path.stem}.chunk{display_chunk_num:02d}.json"
+                try:
+                    with open(debug_json_path, 'w', encoding='utf-8') as dj:
+                        json.dump(result, dj, ensure_ascii=False, indent=2)
+                    print(f"Saved debug JSON: {debug_json_path}")
+                except Exception as _e:
+                    print(f"Warning: could not save debug JSON for chunk {display_chunk_num}: {_e}")
             
             # Get segments first
             segments = result.get('segments', [])
@@ -642,7 +746,6 @@ def main(input_file: str, specified_language: str = None):
             os.remove(wav_file)
             print(f"Cleaned up temporary file: {wav_file}")
 
-
 if __name__ == "__main__":
     # Set up argument parser
     parser = argparse.ArgumentParser(
@@ -692,6 +795,12 @@ Environment:
         help='Language code (e.g., en, zh, ja, fr, de). Default: auto-detect'
     )
     
+    parser.add_argument(
+        '-d', '--debug', 
+        action='store_true',
+        help='Enable debug mode: save raw JSON per chunk and extra logs'
+    )
+    
     # Show help if no arguments provided
     if len(sys.argv) == 1:
         parser.print_help()
@@ -721,4 +830,4 @@ Environment:
         print("Language: Auto-detect mode")
     
     # Run main function
-    main(args.media_file, args.language)
+    main(args.media_file, args.language, debug=args.debug)

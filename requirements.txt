@@ -3,3 +3,10 @@ pydub>=0.25.1
 
 # Environment variable management (optional but recommended)
 python-dotenv>=1.1.1
+
+# VAD dependencies 
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy>=1.21.0
+soundfile>=0.13.1
+pyannote.audio>=3.0.0
